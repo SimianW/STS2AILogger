@@ -6,6 +6,7 @@ using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Models.Potions;
 using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
 
@@ -22,6 +23,7 @@ public static class GameSnapshots
 
         return new
         {
+            seed = runState.Rng.StringSeed,
             game_mode = runState.GameMode.ToString(),
             ascension = runState.AscensionLevel,
             act_index = runState.CurrentActIndex,
@@ -173,6 +175,28 @@ public static class GameSnapshots
         };
     }
 
+    public static object? Potion(PotionModel? potion)
+    {
+        if (potion == null)
+        {
+            return null;
+        }
+
+        return new
+        {
+            id = Id(potion),
+            rarity = potion.Rarity.ToString(),
+            usage = potion.Usage.ToString(),
+            target_type = potion.TargetType.ToString(),
+            slot_index = potion.Owner?.GetPotionSlotIndex(potion)
+        };
+    }
+
+    public static object? Model(AbstractModel? model)
+    {
+        return model == null ? null : new { id = Id(model) };
+    }
+
     private static object? RunBasics(RunState? runState)
     {
         if (runState == null)
@@ -182,6 +206,7 @@ public static class GameSnapshots
 
         return new
         {
+            seed = runState.Rng.StringSeed,
             act_index = runState.CurrentActIndex,
             act_floor = runState.ActFloor,
             total_floor = runState.TotalFloor,

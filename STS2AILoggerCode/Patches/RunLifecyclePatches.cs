@@ -13,6 +13,7 @@ public static class RunEndedPatch
         EventLogger.WriteSafe("run_ended", () =>
         {
             RunState? state = RunManager.Instance.DebugOnlyGetState();
+            EventLogger.SetRunContext(state);
             return new
             {
                 victory = isVictory,
@@ -21,6 +22,6 @@ public static class RunEndedPatch
                 run = GameSnapshots.Run(state),
                 local_player = GameSnapshots.Player(LocalContext.GetMe(state))
             };
-        });
+        }, isVictory ? "run ended: victory" : "run ended: not victory");
     }
 }
