@@ -1,12 +1,24 @@
+# Godot 4+ specific ignores
 .godot/
+
+# Godot 3 specific ignores
+.import/
+export.cfg
+export_presets.cfg
+
+# Mono/C# specific ignores
+.mono/
+data_*/
+
+# .NET Build artifacts
 bin/
-/android/
-.git/
-.idea/
+obj/
+*.csproj.user
 .vs/
-publish/
-Properties/
-packages/
-.editorconfig
-*.user
-Directory.Build.props
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Log files
+logExamples/
