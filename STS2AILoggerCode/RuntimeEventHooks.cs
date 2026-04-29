@@ -59,9 +59,9 @@ public static class RuntimeEventHooks
 
     private static void OnRoomEntered()
     {
+        RunState? state = RunManager.Instance.DebugOnlyGetState();
         EventLogger.WriteSafe("room_entered", () =>
         {
-            RunState? state = RunManager.Instance.DebugOnlyGetState();
             EventLogger.SetRunContext(state);
             return new
             {
@@ -69,6 +69,7 @@ public static class RuntimeEventHooks
                 local_player = GameSnapshots.Player(LocalContext.GetMe(state))
             };
         }, "room entered");
+        MapSelectionLogContext.WriteResolvedIfPending(state);
     }
 
     private static void OnCombatSetUp(CombatState state)
@@ -91,6 +92,7 @@ public static class RuntimeEventHooks
             EventLogger.SetRunContext(state.RunState as RunState);
             return new
             {
+                current_side = state.CurrentSide.ToString(),
                 combat = GameSnapshots.Combat(state),
                 local_player = GameSnapshots.Player(LocalContext.GetMe(state))
             };
@@ -102,8 +104,11 @@ public static class RuntimeEventHooks
         EventLogger.WriteSafe("turn_ended", () =>
         {
             EventLogger.SetRunContext(state.RunState as RunState);
+            string currentSide = state.CurrentSide.ToString();
             return new
             {
+                ended_side = currentSide == "Player" ? "Enemy" : currentSide == "Enemy" ? "Player" : currentSide,
+                current_side = currentSide,
                 combat = GameSnapshots.Combat(state),
                 local_player = GameSnapshots.Player(LocalContext.GetMe(state))
             };
@@ -115,7 +120,7 @@ public static class RuntimeEventHooks
         EventLogger.WriteSafe("combat_ended", () =>
         {
             RunState? state = RunManager.Instance.DebugOnlyGetState();
-            EventLogger.SetRunContext(state);
+            EventLogger.SetRunContext(state, allowLateEventContinuation: true);
             return new
             {
                 room = GameSnapshots.Room(room),

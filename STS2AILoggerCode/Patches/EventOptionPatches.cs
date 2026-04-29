@@ -25,6 +25,11 @@ public static class EventOptionsOfferedPatch
 
             Player? player = __instance.Owner;
             RunState? runState = player?.RunState as RunState;
+            if (EventLogger.IsRunEnded(runState))
+            {
+                return;
+            }
+
             EventLogger.SetRunContext(runState);
             EventLogger.Write("event_options_offered", new
             {

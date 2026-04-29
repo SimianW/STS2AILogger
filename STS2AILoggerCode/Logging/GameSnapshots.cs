@@ -47,6 +47,7 @@ public static class GameSnapshots
             encounter = Id(combatState.Encounter),
             round = combatState.RoundNumber,
             side = combatState.CurrentSide.ToString(),
+            current_side = combatState.CurrentSide.ToString(),
             run = RunBasics(combatState.RunState as RunState),
             players = combatState.Players.Select(Player).ToList(),
             enemies = combatState.Enemies.Select(Creature).ToList()
@@ -150,15 +151,20 @@ public static class GameSnapshots
         };
     }
 
-    public static object CardPlay(CardPlay? cardPlay)
+    public static object CardPlay(CardPlay? cardPlay, string? correlationId = null)
     {
         if (cardPlay == null)
         {
-            return new { card = (object?)null };
+            return new
+            {
+                correlation_id = correlationId,
+                card = (object?)null
+            };
         }
 
         return new
         {
+            correlation_id = correlationId,
             card = Card(cardPlay.Card),
             target = Creature(cardPlay.Target),
             result_pile = cardPlay.ResultPile.ToString(),

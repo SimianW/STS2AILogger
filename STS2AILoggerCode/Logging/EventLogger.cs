@@ -12,8 +12,9 @@ namespace STS2AILogger.STS2AILoggerCode.Logging;
 
 public static class EventLogger
 {
-    private const int SchemaVersion = 2;
-    private const int MaxInGameEventDescriptionLength = 800;
+    private const int SchemaVersion = 4;
+    private const string LogVersion = "alpha.1";
+    private const int MaxInGameEventDescriptionLength = 220;
 
     private static readonly object Lock = new();
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -25,6 +26,8 @@ public static class EventLogger
     private static string? _logPath;
     private static string? _sessionId;
     private static string? _runId;
+    private static string? _runKey;
+    private static LoggerLaunchOptions? _launchOptions;
     private static long _eventIndex;
     private static string? _deckMutationCachePath;
     private static RewindDetection? _pendingRewindDetection;
@@ -33,6 +36,9 @@ public static class EventLogger
     public static string? LogPath => _logPath;
     public static string? SessionId => _sessionId;
     public static string? RunId => _runId;
+    public static string? RunKey => _runKey;
+    public static string DataType => (_launchOptions ??= LoggerLaunchOptions.FromProcess()).DataType;
+    public static string Version => LogVersion;
     public static bool CurrentRunHasPriorEvents => _runId != null && _eventIndex > 1;
     public static long NextEventIndex => _eventIndex;
 
@@ -64,15 +70,19 @@ public static class EventLogger
             string timestamp = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmss");
             _sessionId = $"session-{timestamp}";
             _logPath = Path.Combine(_loggerDir, "sessions", $"{_sessionId}.jsonl");
+            _launchOptions ??= LoggerLaunchOptions.FromProcess();
             _eventIndex = 0;
 
             Write("logger_initialized", new
             {
                 log_path = _logPath,
-                session_id = _sessionId
+                session_id = _sessionId,
+                schema_version = SchemaVersion,
+                mod_log_version = LogVersion,
+                data_type = DataType
             }, "logger initialized");
 
-            Info($"session log: {_logPath}");
+            Info($"STS2AILogger {LogVersion} session={_sessionId} data_type={DataType}");
         }
         catch (Exception ex)
         {
@@ -80,7 +90,7 @@ public static class EventLogger
         }
     }
 
-    public static void SetRunContext(RunState? runState)
+    public static void SetRunContext(RunState? runState, bool allowLateEventContinuation = false)
     {
         try
         {
@@ -94,12 +104,14 @@ public static class EventLogger
                 Initialize();
             }
 
-            string runId = BuildRunId(runState);
-            string runLogPath = Path.Combine(_loggerDir!, "runs", $"{runId}.jsonl");
-            if (HasRunEnded(runLogPath))
+            string runKey = RunLogContext.BuildRunKey(runState);
+            string runId = runKey;
+            string runLogPath = RunLogContext.BuildRunPath(_loggerDir!, runId);
+            bool isLateEventContinuation = allowLateEventContinuation && _runKey == runKey && _runId == runKey;
+            if (!isLateEventContinuation && RunLogContext.HasRunEnded(runLogPath))
             {
-                runId = $"{runId}-rerun-{_sessionId}";
-                runLogPath = Path.Combine(_loggerDir!, "runs", $"{runId}.jsonl");
+                runId = RunLogContext.BuildRerunId(runKey, _sessionId!);
+                runLogPath = RunLogContext.BuildRunPath(_loggerDir!, runId);
             }
 
             if (_runId == runId)
@@ -111,6 +123,7 @@ public static class EventLogger
             _pendingRewindDetection = isContinuing ? BuildRewindDetection(runLogPath, runState) : null;
 
             _runId = runId;
+            _runKey = runKey;
             _logPath = runLogPath;
             _eventIndex = CountLines(runLogPath);
             LoadDeckMutationCache(runLogPath);
@@ -120,9 +133,14 @@ public static class EventLogger
             Write("run_log_attached", new
             {
                 run_id = _runId,
+                run_key = _runKey,
                 session_id = _sessionId,
+                schema_version = SchemaVersion,
+                mod_log_version = LogVersion,
+                data_type = DataType,
                 log_path = _logPath,
                 continuing = isContinuing,
+                is_late_event_continuation = isLateEventContinuation,
                 seed = runState.Rng.StringSeed,
                 game_mode = runState.GameMode.ToString(),
                 ascension = runState.AscensionLevel,
@@ -132,6 +150,31 @@ public static class EventLogger
         catch (Exception ex)
         {
             Error($"Failed to set run log context: {ex}");
+        }
+    }
+
+    public static bool IsRunEnded(RunState? runState)
+    {
+        try
+        {
+            if (runState == null || _loggerDir == null)
+            {
+                return false;
+            }
+
+            string runKey = RunLogContext.BuildRunKey(runState);
+            if (_runKey == runKey && _logPath != null && RunLogContext.HasRunEnded(_logPath))
+            {
+                return true;
+            }
+
+            string runLogPath = RunLogContext.BuildRunPath(_loggerDir, runKey);
+            return RunLogContext.HasRunEnded(runLogPath);
+        }
+        catch (Exception ex)
+        {
+            Error($"Failed to check run ended state: {ex}");
+            return false;
         }
     }
 
@@ -226,6 +269,8 @@ public static class EventLogger
                 ["timestamp_utc"] = DateTimeOffset.UtcNow.ToString("O"),
                 ["session_id"] = _sessionId,
                 ["run_id"] = _runId,
+                ["run_key"] = _runKey,
+                ["data_type"] = DataType,
                 ["type"] = type,
                 ["summary"] = summary,
                 ["payload"] = payload
@@ -248,17 +293,14 @@ public static class EventLogger
 
     private static string BuildInGameEventLog(long eventIndex, string type, string? summary, object? payload)
     {
-        string description = BuildEventDescription(type, payload);
+        string description = BuildCompactEventDescription(type, payload);
         if (string.IsNullOrWhiteSpace(description))
         {
             description = summary ?? "event written";
         }
 
-        string message = $"jsonl #{eventIndex} {type}: {description}";
-        if (!string.IsNullOrWhiteSpace(_runId))
-        {
-            message += $" | run={_runId}";
-        }
+        string message = $"#{eventIndex} {type}";
+        message += string.IsNullOrWhiteSpace(description) ? "" : $" {description}";
 
         if (message.Length <= MaxInGameEventDescriptionLength)
         {
@@ -266,6 +308,58 @@ public static class EventLogger
         }
 
         return message[..(MaxInGameEventDescriptionLength - 3)] + "...";
+    }
+
+    private static string BuildCompactEventDescription(string type, object? payload)
+    {
+        if (payload == null)
+        {
+            return "";
+        }
+
+        try
+        {
+            JsonElement root = JsonSerializer.SerializeToElement(payload, JsonOptions);
+            return type switch
+            {
+                "logger_initialized" => $"session={JsonString(root, "session_id")}",
+                "run_log_attached" => $"run={JsonString(root, "run_id")} seed={JsonString(root, "seed")}",
+                "run_started" => CompactRunState(root, "start"),
+                "run_loaded" => CompactRunState(root, "load"),
+                "state_rewind_detected" => $"rewind {JsonInt(root, "invalidated_from_event_index")}-{JsonInt(root, "invalidated_to_event_index")}",
+                "room_entered" => CompactRoom(root),
+                "combat_setup" => CompactCombat(root, "setup"),
+                "turn_started" => CompactCombat(root, "turn"),
+                "turn_ended" => CompactTurnEnded(root),
+                "combat_ended" => CompactCombatEnded(root),
+                "player_ended_turn" => CompactPlayerEndedTurn(root),
+                "card_play_started" => CompactCardPlay(root, ">"),
+                "card_play_finished" => CompactCardPlay(root, "done"),
+                "card_selection_offered" => CompactCardSelectionOffered(root),
+                "card_selection_selected" => CompactCardSelectionSelected(root),
+                "deck_card_added" => CompactDeckMutation(root, "+deck"),
+                "deck_card_removed" => CompactDeckMutation(root, "-deck"),
+                "event_options_offered" => CompactEventOptions(root),
+                "event_option_selected" => CompactEventOption(root),
+                "potion_use_started" => CompactPotion(root, "potion_start"),
+                "potion_used" => CompactPotion(root, "potion_used"),
+                "potion_discarded" => CompactPotion(root, "potion_discard"),
+                "shop_items_offered" => CompactShopOffered(root),
+                "shop_item_purchased" => CompactShopPurchased(root),
+                "run_ended" => CompactRunEnded(root),
+                "map_nodes_offered" => CompactMapNodesOffered(root),
+                "map_node_selected" => CompactMapNodeSelected(root),
+                "map_node_resolved" => CompactMapNodeResolved(root),
+                "treasure_relics_offered" => CompactTreasureRelicsOffered(root),
+                "treasure_relic_selected" => CompactTreasureRelicResult(root, "pick"),
+                "treasure_relic_skipped" => CompactTreasureRelicResult(root, "skip"),
+                _ => ""
+            };
+        }
+        catch (Exception ex)
+        {
+            return $"description_failed={ex.GetType().Name}";
+        }
     }
 
     private static string BuildEventDescription(string type, object? payload)
@@ -293,6 +387,8 @@ public static class EventLogger
                 "player_ended_turn" => DescribePlayerEndedTurn(root),
                 "card_play_started" => DescribeCardPlay(root, "started"),
                 "card_play_finished" => DescribeCardPlay(root, "finished"),
+                "card_selection_offered" => DescribeCardSelectionOffered(root),
+                "card_selection_selected" => DescribeCardSelectionSelected(root),
                 "deck_card_added" => DescribeDeckMutation(root, "added"),
                 "deck_card_removed" => DescribeDeckMutation(root, "removed"),
                 "event_options_offered" => DescribeEventOptionsOffered(root),
@@ -315,6 +411,136 @@ public static class EventLogger
     private static string DescribeLoggerInitialized(JsonElement root)
     {
         return $"session log initialized at {JsonString(root, "log_path")}";
+    }
+
+    private static string CompactRunState(JsonElement root, string action)
+    {
+        TryGetObject(root, "run", out JsonElement run);
+        TryGetObject(root, "local_player", out JsonElement player);
+        return $"{action} floor={JsonInt(run, "total_floor")} hp={JsonInt(player, "hp")}/{JsonInt(player, "max_hp")} gold={JsonInt(player, "gold")}";
+    }
+
+    private static string CompactRoom(JsonElement root)
+    {
+        TryGetObject(root, "run", out JsonElement run);
+        return $"floor={JsonInt(run, "total_floor")} room={DescribeRoomFromRun(run)}";
+    }
+
+    private static string CompactCombat(JsonElement root, string action)
+    {
+        TryGetObject(root, "combat", out JsonElement combat);
+        return $"{action} {JsonString(combat, "encounter")} r{JsonInt(combat, "round")} side={JsonString(combat, "current_side")}";
+    }
+
+    private static string CompactTurnEnded(JsonElement root)
+    {
+        TryGetObject(root, "combat", out JsonElement combat);
+        string endedSide = JsonString(root, "ended_side");
+        return $"ended={endedSide} r{JsonInt(combat, "round")} now={JsonString(root, "current_side")}";
+    }
+
+    private static string CompactCombatEnded(JsonElement root)
+    {
+        TryGetObject(root, "run", out JsonElement run);
+        TryGetObject(root, "local_player", out JsonElement player);
+        return $"floor={JsonInt(run, "total_floor")} hp={JsonInt(player, "hp")}/{JsonInt(player, "max_hp")}";
+    }
+
+    private static string CompactPlayerEndedTurn(JsonElement root)
+    {
+        TryGetObject(root, "player", out JsonElement player);
+        TryGetObject(root, "combat", out JsonElement combat);
+        return $"player={JsonInt(player, "net_id")} r{JsonInt(combat, "round")} energy={JsonInt(player, "energy")}";
+    }
+
+    private static string CompactCardPlay(JsonElement root, string action)
+    {
+        TryGetObject(root, "card_play", out JsonElement cardPlay);
+        TryGetObject(cardPlay, "card", out JsonElement card);
+        TryGetObject(cardPlay, "target", out JsonElement target);
+        string targetText = target.ValueKind == JsonValueKind.Object ? $" -> {JsonString(target, "name")}" : "";
+        return $"{action} {JsonString(card, "id")}{targetText}";
+    }
+
+    private static string CompactCardSelectionOffered(JsonElement root)
+    {
+        return $"{JsonString(root, "selection_kind")} id={JsonString(root, "selection_id")} choices={JsonArrayLength(root, "candidates")}";
+    }
+
+    private static string CompactCardSelectionSelected(JsonElement root)
+    {
+        return $"{JsonString(root, "selection_kind")} id={JsonString(root, "selection_id")} pick=[{CompactSelectedCards(root)}]";
+    }
+
+    private static string CompactDeckMutation(JsonElement root, string action)
+    {
+        TryGetObject(root, "card", out JsonElement card);
+        return $"{action} {JsonString(card, "id")}";
+    }
+
+    private static string CompactEventOptions(JsonElement root)
+    {
+        TryGetObject(root, "event", out JsonElement eventElement);
+        return $"{JsonString(eventElement, "id")} options={JsonArrayLength(root, "options")}";
+    }
+
+    private static string CompactEventOption(JsonElement root)
+    {
+        TryGetObject(root, "event", out JsonElement eventElement);
+        return $"{JsonString(eventElement, "id")} pick={JsonInt(root, "option_index")}";
+    }
+
+    private static string CompactPotion(JsonElement root, string action)
+    {
+        TryGetObject(root, "potion", out JsonElement potion);
+        return $"{action} {JsonString(potion, "id")}";
+    }
+
+    private static string CompactShopOffered(JsonElement root)
+    {
+        TryGetObject(root, "shop", out JsonElement shop);
+        return $"cards={JsonArrayLength(shop, "cards")} relics={JsonArrayLength(shop, "relics")} potions={JsonArrayLength(shop, "potions")}";
+    }
+
+    private static string CompactShopPurchased(JsonElement root)
+    {
+        TryGetObject(root, "item", out JsonElement item);
+        return $"{DescribeShopEntry(item)} spent={JsonInt(root, "gold_spent")}";
+    }
+
+    private static string CompactRunEnded(JsonElement root)
+    {
+        TryGetObject(root, "run", out JsonElement run);
+        TryGetObject(root, "local_player", out JsonElement player);
+        return $"victory={JsonBool(root, "victory")} floor={JsonInt(run, "total_floor")} hp={JsonInt(player, "hp")}";
+    }
+
+    private static string CompactMapNodesOffered(JsonElement root)
+    {
+        return $"id={JsonString(root, "selection_id")} choices={JsonArrayLength(root, "available_nodes")}";
+    }
+
+    private static string CompactMapNodeSelected(JsonElement root)
+    {
+        TryGetObject(root, "selected", out JsonElement selected);
+        TryGetObject(selected, "coord", out JsonElement coord);
+        return $"id={JsonString(root, "selection_id")} coord=({JsonInt(coord, "row")},{JsonInt(coord, "col")}) type={JsonString(selected, "map_point_type_before_reveal")}";
+    }
+
+    private static string CompactMapNodeResolved(JsonElement root)
+    {
+        TryGetObject(root, "resolved_room", out JsonElement room);
+        return $"id={JsonString(root, "selection_id")} -> {JsonString(room, "type")} {JsonString(room, "model")}";
+    }
+
+    private static string CompactTreasureRelicsOffered(JsonElement root)
+    {
+        return $"id={JsonString(root, "selection_id")} relics={JsonArrayLength(root, "candidates")} skip={JsonBool(root, "can_skip")}";
+    }
+
+    private static string CompactTreasureRelicResult(JsonElement root, string action)
+    {
+        return $"{action} id={JsonString(root, "selection_id")} result={JsonString(root, "selection_result")}";
     }
 
     private static string DescribeRunLogAttached(JsonElement root)
@@ -405,6 +631,18 @@ public static class EventLogger
             : "no target";
 
         return $"card play {action}: {JsonString(card, "id")} -> {targetText} result={JsonString(cardPlay, "result_pile")} energy_spent={JsonInt(resources, "energy_spent")} encounter={JsonString(combat, "encounter")} round={JsonInt(combat, "round")}";
+    }
+
+    private static string DescribeCardSelectionOffered(JsonElement root)
+    {
+        TryGetObject(root, "player", out JsonElement player);
+        return $"card selection offered: id={JsonString(root, "selection_id")} kind={JsonString(root, "selection_kind")} player={JsonInt(player, "net_id")} candidates={JsonArrayLength(root, "candidates")} min={JsonInt(root, "min_select")} max={JsonInt(root, "max_select")}";
+    }
+
+    private static string DescribeCardSelectionSelected(JsonElement root)
+    {
+        TryGetObject(root, "player", out JsonElement player);
+        return $"card selection selected: id={JsonString(root, "selection_id")} kind={JsonString(root, "selection_kind")} player={JsonInt(player, "net_id")} selected=[{DescribeSelectedCards(root)}] skipped={JsonBool(root, "skipped")}";
     }
 
     private static string DescribeDeckMutation(JsonElement root, string action)
@@ -534,6 +772,34 @@ public static class EventLogger
         }));
     }
 
+    private static string DescribeSelectedCards(JsonElement root)
+    {
+        if (!root.TryGetProperty("selected", out JsonElement selected) || selected.ValueKind != JsonValueKind.Array)
+        {
+            return "";
+        }
+
+        return string.Join(", ", selected.EnumerateArray().Select(item =>
+        {
+            TryGetObject(item, "card", out JsonElement card);
+            return $"{JsonInt(item, "index")}:{JsonString(card, "id")}";
+        }));
+    }
+
+    private static string CompactSelectedCards(JsonElement root)
+    {
+        if (!root.TryGetProperty("selected", out JsonElement selected) || selected.ValueKind != JsonValueKind.Array)
+        {
+            return "";
+        }
+
+        return string.Join(",", selected.EnumerateArray().Select(item =>
+        {
+            TryGetObject(item, "card", out JsonElement card);
+            return JsonString(card, "id");
+        }).Where(id => !string.IsNullOrWhiteSpace(id)));
+    }
+
     private static string JsonString(JsonElement element, string propertyName)
     {
         if (!element.TryGetProperty(propertyName, out JsonElement property))
@@ -608,29 +874,9 @@ public static class EventLogger
         }
     }
 
-    private static string BuildRunId(RunState runState)
-    {
-        string seed = SanitizeForFileName(runState.Rng.StringSeed);
-        string character = SanitizeForFileName(runState.Players.FirstOrDefault()?.Character.Id.ToString() ?? "UNKNOWN_CHARACTER");
-        string gameMode = SanitizeForFileName(runState.GameMode.ToString());
-        return $"{seed}-{character}-A{runState.AscensionLevel}-{gameMode}";
-    }
-
-    private static string SanitizeForFileName(string value)
-    {
-        char[] chars = value.Select(ch => char.IsLetterOrDigit(ch) ? ch : '_').ToArray();
-        string sanitized = new(chars);
-        return string.IsNullOrWhiteSpace(sanitized) ? "unknown" : sanitized;
-    }
-
     private static long CountLines(string path)
     {
         return File.Exists(path) ? File.ReadLines(path).LongCount() : 0;
-    }
-
-    private static bool HasRunEnded(string path)
-    {
-        return File.Exists(path) && File.ReadLines(path).Any(line => line.Contains("\"type\":\"run_ended\""));
     }
 
     private static RewindDetection? BuildRewindDetection(string path, RunState loadedRunState)
@@ -649,7 +895,7 @@ public static class EventLogger
             return null;
         }
 
-        StateSnapshot? lastMatching = snapshots.LastOrDefault(snapshot => HasSamePlayerState(snapshot, loaded));
+        StateSnapshot? lastMatching = snapshots.LastOrDefault(snapshot => HasSameComparableState(snapshot, loaded));
         long? invalidatedFrom = lastMatching == null ? null : lastMatching.EventIndex + 1;
         return new RewindDetection(previous, lastMatching, invalidatedFrom, differences);
     }
@@ -702,6 +948,13 @@ public static class EventLogger
             eventIndex,
             typeElement.GetString() ?? "",
             root.TryGetProperty("summary", out JsonElement summaryElement) ? summaryElement.GetString() : null,
+            ReadActIndex(payload),
+            ReadTotalFloor(payload),
+            ReadRoomField(payload, "type"),
+            ReadRoomField(payload, "model"),
+            ReadInCombat(payload, player),
+            ReadCombatField(payload, "encounter"),
+            ReadCombatRound(payload),
             ReadNullableInt(player, "hp"),
             ReadNullableInt(player, "max_hp"),
             ReadNullableInt(player, "gold"),
@@ -744,13 +997,22 @@ public static class EventLogger
         Player? player = runState.Players.FirstOrDefault();
         if (player == null)
         {
-            return new StateSnapshot(-1, "loaded_state", null, null, null, null, new List<string>(), new List<string>(), new List<string>());
+            return new StateSnapshot(-1, "loaded_state", null, runState.CurrentActIndex, runState.TotalFloor, null, null, false, null, null, null, null, null, new List<string>(), new List<string>(), new List<string>());
         }
+
+        bool inCombat = player.Creature.CombatState != null;
 
         return new StateSnapshot(
             -1,
             "loaded_state",
             null,
+            runState.CurrentActIndex,
+            runState.TotalFloor,
+            runState.CurrentRoom?.RoomType.ToString(),
+            runState.CurrentRoom?.ModelId?.ToString(),
+            inCombat,
+            player.Creature.CombatState?.Encounter?.Id.ToString(),
+            player.Creature.CombatState?.RoundNumber,
             player.Creature.CurrentHp,
             player.Creature.MaxHp,
             player.Gold,
@@ -759,9 +1021,100 @@ public static class EventLogger
             player.PotionSlots.Select(potion => potion?.Id.ToString() ?? "").ToList());
     }
 
+    private static int? ReadActIndex(JsonElement payload)
+    {
+        if (TryGetObject(payload, "run", out JsonElement run))
+        {
+            return ReadNullableInt(run, "act_index");
+        }
+
+        if (TryGetObject(payload, "combat", out JsonElement combat) &&
+            TryGetObject(combat, "run", out JsonElement combatRun))
+        {
+            return ReadNullableInt(combatRun, "act_index");
+        }
+
+        return null;
+    }
+
+    private static int? ReadTotalFloor(JsonElement payload)
+    {
+        if (TryGetObject(payload, "run", out JsonElement run))
+        {
+            return ReadNullableInt(run, "total_floor");
+        }
+
+        if (TryGetObject(payload, "combat", out JsonElement combat) &&
+            TryGetObject(combat, "run", out JsonElement combatRun))
+        {
+            return ReadNullableInt(combatRun, "total_floor");
+        }
+
+        return null;
+    }
+
+    private static string? ReadRoomField(JsonElement payload, string field)
+    {
+        if (TryGetObject(payload, "run", out JsonElement run) &&
+            TryGetObject(run, "room", out JsonElement runRoom))
+        {
+            return ReadNullableString(runRoom, field);
+        }
+
+        if (TryGetObject(payload, "room", out JsonElement room))
+        {
+            return ReadNullableString(room, field);
+        }
+
+        if (TryGetObject(payload, "combat", out JsonElement combat) &&
+            TryGetObject(combat, "run", out JsonElement combatRun) &&
+            TryGetObject(combatRun, "room", out JsonElement combatRoom))
+        {
+            return ReadNullableString(combatRoom, field);
+        }
+
+        return null;
+    }
+
+    private static bool? ReadInCombat(JsonElement payload, JsonElement player)
+    {
+        if (player.TryGetProperty("in_combat", out JsonElement inCombat))
+        {
+            return inCombat.ValueKind switch
+            {
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                _ => null
+            };
+        }
+
+        return TryGetObject(payload, "combat", out _) ? true : null;
+    }
+
+    private static string? ReadCombatField(JsonElement payload, string field)
+    {
+        return TryGetObject(payload, "combat", out JsonElement combat)
+            ? ReadNullableString(combat, field)
+            : null;
+    }
+
+    private static int? ReadCombatRound(JsonElement payload)
+    {
+        return TryGetObject(payload, "combat", out JsonElement combat)
+            ? ReadNullableInt(combat, "round")
+            : null;
+    }
+
     private static List<object> BuildDifferences(StateSnapshot previous, StateSnapshot loaded)
     {
         var differences = new List<object>();
+        AddScalarDifference(differences, "act_index", previous.ActIndex, loaded.ActIndex);
+        AddScalarDifference(differences, "total_floor", previous.TotalFloor, loaded.TotalFloor);
+        AddStringDifference(differences, "room_type", previous.RoomType, loaded.RoomType);
+        AddStringDifference(differences, "room_model", previous.RoomModel, loaded.RoomModel);
+        AddBoolDifference(differences, "in_combat", previous.InCombat, loaded.InCombat);
+        AddStringDifference(differences, "combat_encounter", previous.CombatEncounter, loaded.CombatEncounter);
+        AddScalarDifference(differences, "combat_round", previous.CombatRound, loaded.CombatRound);
         AddScalarDifference(differences, "hp", previous.Hp, loaded.Hp);
         AddScalarDifference(differences, "max_hp", previous.MaxHp, loaded.MaxHp);
         AddScalarDifference(differences, "gold", previous.Gold, loaded.Gold);
@@ -772,6 +1125,36 @@ public static class EventLogger
     }
 
     private static void AddScalarDifference(List<object> differences, string field, int? previous, int? loaded)
+    {
+        if (previous == loaded)
+        {
+            return;
+        }
+
+        differences.Add(new
+        {
+            field,
+            previous,
+            loaded
+        });
+    }
+
+    private static void AddStringDifference(List<object> differences, string field, string? previous, string? loaded)
+    {
+        if (previous == loaded)
+        {
+            return;
+        }
+
+        differences.Add(new
+        {
+            field,
+            previous,
+            loaded
+        });
+    }
+
+    private static void AddBoolDifference(List<object> differences, string field, bool? previous, bool? loaded)
     {
         if (previous == loaded)
         {
@@ -803,14 +1186,39 @@ public static class EventLogger
         });
     }
 
-    private static bool HasSamePlayerState(StateSnapshot left, StateSnapshot right)
+    private static bool HasSameComparableState(StateSnapshot left, StateSnapshot right)
     {
         return left.Hp == right.Hp &&
                left.MaxHp == right.MaxHp &&
                left.Gold == right.Gold &&
                left.Deck.SequenceEqual(right.Deck) &&
                left.Relics.SequenceEqual(right.Relics) &&
-               left.Potions.SequenceEqual(right.Potions);
+               left.Potions.SequenceEqual(right.Potions) &&
+               LocationMatches(left, right);
+    }
+
+    private static bool LocationMatches(StateSnapshot left, StateSnapshot right)
+    {
+        if (left.ActIndex != right.ActIndex || left.TotalFloor != right.TotalFloor)
+        {
+            return false;
+        }
+
+        bool roomMatches = string.IsNullOrEmpty(right.RoomType) ||
+                           (left.RoomType == right.RoomType && left.RoomModel == right.RoomModel);
+        if (!roomMatches)
+        {
+            return false;
+        }
+
+        if (right.InCombat != true)
+        {
+            return true;
+        }
+
+        return left.InCombat == right.InCombat &&
+               left.CombatEncounter == right.CombatEncounter &&
+               left.CombatRound == right.CombatRound;
     }
 
     private static List<string> MultisetExcept(IReadOnlyList<string> left, IReadOnlyList<string> right)
@@ -880,6 +1288,23 @@ public static class EventLogger
         }
 
         return value;
+    }
+
+    private static string? ReadNullableString(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out JsonElement property))
+        {
+            return null;
+        }
+
+        return property.ValueKind switch
+        {
+            JsonValueKind.String => property.GetString(),
+            JsonValueKind.Number => property.GetRawText(),
+            JsonValueKind.True => "true",
+            JsonValueKind.False => "false",
+            _ => null
+        };
     }
 
     private static List<string> ReadStringArray(JsonElement element, string propertyName, string? nestedPropertyName = null)
@@ -1039,6 +1464,13 @@ public static class EventLogger
         long EventIndex,
         string EventType,
         string? Summary,
+        int? ActIndex,
+        int? TotalFloor,
+        string? RoomType,
+        string? RoomModel,
+        bool? InCombat,
+        string? CombatEncounter,
+        int? CombatRound,
         int? Hp,
         int? MaxHp,
         int? Gold,

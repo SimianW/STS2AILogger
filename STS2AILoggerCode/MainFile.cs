@@ -15,14 +15,16 @@ public partial class MainFile : Node
 
     public static void Initialize()
     {
-        EventLogger.Info("Initializing started");
+        EventLogger.Info(@" /\_/\");
+        EventLogger.Info($"( o.o )  STS2 AI Logger {EventLogger.Version}");
+        EventLogger.Info(@" > ^ <   JSONL facts, one fact at a time");
+        EventLogger.Info($"STS2AILogger {EventLogger.Version} initializing");
         EventLogger.Initialize();
 
         Harmony harmony = new(ModId);
         harmony.PatchAll();
         RuntimeEventHooks.Initialize();
 
-        EventLogger.Info("Harmony PatchAll finished");
+        EventLogger.Info($"STS2AILogger {EventLogger.Version} ready");
     }
 }
-
